@@ -16,6 +16,16 @@
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <time.h>
+#if __has_include("config.h")
+#include "config.h"            // cau hinh rieng (Wi-Fi, MQTT) - khong dua len git
+#else
+#include "config.example.h"
+#endif
+#include "ca_cert.h"
 
 // ---------------- Cau hinh ----------------
 #define LIDAR_RX_PIN     16      // ESP32 RX2  <- RPLIDAR TX
@@ -119,17 +129,36 @@ static uint32_t revCount = 0;
 static uint16_t pointsInRev = 0;
 static float    nearestDist = 0, nearestAngle = 0;
 static uint16_t sectorMin[NUM_SECTORS];
+static uint16_t binMm[360];             // khoang cach (mm) theo tung 1 do cua vong dang quet
+
+// Vong quay hoan chinh gan nhat, chia se cho task mang
+static SemaphoreHandle_t snapMutex;
+static uint16_t snapMm[360];
+static uint32_t snapRev = 0, snapPoints = 0, snapTimeMs = 0;
+static float    snapNearest = 0, snapNearestAngle = 0;
+static bool     snapValid = false;
 
 static void resetRevolution() {
   pointsInRev = 0;
   nearestDist = 0;
   nearestAngle = 0;
   for (int i = 0; i < NUM_SECTORS; i++) sectorMin[i] = 0;
+  memset(binMm, 0, sizeof binMm);
 }
 
 static void printRevolution() {
   if (pointsInRev == 0) return;
   revCount++;
+  if (snapMutex && xSemaphoreTake(snapMutex, 0) == pdTRUE) {   // khong bao gio cho: uu tien doc lidar
+    memcpy(snapMm, binMm, sizeof snapMm);
+    snapRev = revCount;
+    snapPoints = pointsInRev;
+    snapNearest = nearestDist;
+    snapNearestAngle = nearestAngle;
+    snapTimeMs = millis();
+    snapValid = true;
+    xSemaphoreGive(snapMutex);
+  }
   Serial.printf("REV %lu | points=%u | nearest=%.0f mm @ %.1f deg\n",
                 (unsigned long)revCount, pointsInRev, nearestDist, nearestAngle);
   Serial.print("  min mm per 10deg: ");
@@ -158,6 +187,123 @@ static void handlePoint(bool startFlag, uint8_t quality, float angle, float dist
   int s = (int)(angle / SECTOR_DEG) % NUM_SECTORS;
   uint16_t d = (uint16_t)dist;
   if (sectorMin[s] == 0 || d < sectorMin[s]) sectorMin[s] = d;
+  int b = (int)angle % 360;
+  if (binMm[b] == 0 || d < binMm[b]) binMm[b] = d;
+}
+
+// ---------------- Wi-Fi + MQTT (task rieng tren core 0) ----------------
+#define WF_LOG(...) do { Serial.print("[WF] "); Serial.printf(__VA_ARGS__); Serial.println(); } while (0)
+
+static char jsonBuf[4096];
+
+// Tra ve do dai JSON, 0 neu khong vua buffer
+static size_t buildJson() {
+  uint32_t rev = 0, points = 0, age = 0;
+  float nearest = 0, nearestAngle = 0;
+  bool valid = false;
+  static uint16_t mm[360];
+  if (xSemaphoreTake(snapMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    valid = snapValid;
+    if (valid) {
+      memcpy(mm, snapMm, sizeof mm);
+      rev = snapRev; points = snapPoints; nearest = snapNearest; nearestAngle = snapNearestAngle;
+      age = millis() - snapTimeMs;
+    }
+    xSemaphoreGive(snapMutex);
+  }
+  const char *status = !valid ? "no_data" : age > 3000 ? "stale" : "ok";
+  int n = snprintf(jsonBuf, sizeof jsonBuf,
+    "{\"sensor\":\"RPLIDAR-A1M8\",\"status\":\"%s\",\"unit\":\"mm\",\"step_deg\":1,"
+    "\"rev\":%lu,\"points\":%lu,\"nearest_mm\":%.0f,\"nearest_deg\":%.1f,"
+    "\"age_ms\":%lu,\"rssi\":%d,\"uptime_s\":%lu",
+    status, (unsigned long)rev, (unsigned long)points, nearest, nearestAngle,
+    (unsigned long)age, (int)WiFi.RSSI(), (unsigned long)(millis() / 1000));
+  if (n < 0 || (size_t)n >= sizeof jsonBuf) return 0;
+  size_t len = n;
+  if (!strcmp(status, "ok")) {
+    len += snprintf(jsonBuf + len, sizeof jsonBuf - len, ",\"ranges\":[");
+    for (int i = 0; i < 360; i++) {
+      if (sizeof jsonBuf - len < 16) return 0;
+      if (mm[i]) len += snprintf(jsonBuf + len, sizeof jsonBuf - len, "%u%s", mm[i], i < 359 ? "," : "");
+      else       len += snprintf(jsonBuf + len, sizeof jsonBuf - len, "null%s", i < 359 ? "," : "");
+    }
+    len += snprintf(jsonBuf + len, sizeof jsonBuf - len, "]");
+  }
+  if (sizeof jsonBuf - len < 3) return 0;
+  jsonBuf[len++] = '}';
+  jsonBuf[len] = 0;
+  return len;
+}
+
+static bool wifiConnect() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WF_LOG("Dang ket noi Wi-Fi \"%s\"...", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(250);
+  if (WiFi.status() != WL_CONNECTED) {
+    WF_LOG("Khong ket noi duoc Wi-Fi (status %d): kiem tra ten/mat khau, mang phai la 2.4 GHz", (int)WiFi.status());
+    WiFi.disconnect();
+    return false;
+  }
+  WF_LOG("IP %s, RSSI %d dBm, kenh %d", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), (int)WiFi.channel());
+  return true;
+}
+
+static bool timeSync() {
+  if (time(nullptr) > 1735689600) return true;      // da dong bo (sau 2025-01-01)
+  WF_LOG("Dong bo gio NTP...");
+  configTime(TZ_OFFSET_S, 0, "pool.ntp.org", "time.google.com");
+  uint32_t t0 = millis();
+  while (time(nullptr) < 1735689600 && millis() - t0 < 20000) delay(250);
+  if (time(nullptr) < 1735689600) { WF_LOG("Khong dong bo duoc gio (UDP 123 bi chan?)"); return false; }
+  WF_LOG("Gio OK");
+  return true;
+}
+
+static void netTask(void *) {
+  WiFiClientSecure tls;
+  PubSubClient mqtt(tls);
+  uint32_t lastPublish = 0, publishCount = 0;
+  for (;;) {
+    if (!wifiConnect() || !timeSync()) { delay(5000); continue; }
+    if (!mqtt.connected()) {
+      tls.stop();
+      tls.setCACert(CA_CERT_PEM);                    // xac thuc chung chi va hostname cua broker
+      tls.setHandshakeTimeout(30);
+      mqtt.setServer(MQTT_HOST, MQTT_PORT);
+      mqtt.setSocketTimeout(20);
+      mqtt.setKeepAlive(60);
+      mqtt.setBufferSize(4096);
+      WF_LOG("MQTT TLS toi %s:%d (client %s)", MQTT_HOST, MQTT_PORT, MQTT_CLIENT_ID);
+      bool ok = mqtt.connect(MQTT_CLIENT_ID, strlen(MQTT_USER) ? MQTT_USER : nullptr,
+                             strlen(MQTT_PASS) ? MQTT_PASS : nullptr);
+      if (!ok) {
+        char err[128] = "";
+        int code = tls.lastError(err, sizeof err);
+        WF_LOG("MQTT that bai: state %d, TLS %d %s. Thu lai sau 5 s", mqtt.state(), code, err);
+        delay(5000);
+        continue;
+      }
+      WF_LOG("MQTT da ket noi, topic %s", MQTT_TOPIC);
+      lastPublish = millis() - PUBLISH_INTERVAL_MS;
+    }
+    mqtt.loop();
+    if (millis() - lastPublish >= PUBLISH_INTERVAL_MS) {
+      lastPublish = millis();
+      size_t len = buildJson();
+      if (!len) { WF_LOG("Payload khong vua buffer, bo qua"); }
+      else if (mqtt.publish(MQTT_TOPIC, (const uint8_t *)jsonBuf, len, false)) {
+        if (++publishCount % 10 == 1) WF_LOG("Publish #%lu OK (%u byte)", (unsigned long)publishCount, (unsigned)len);
+      } else {
+        WF_LOG("Publish that bai, state %d: ket noi lai", mqtt.state());
+        mqtt.disconnect();
+      }
+    }
+    delay(20);
+  }
 }
 
 // Moi diem 5 byte:
@@ -235,6 +381,10 @@ void setup() {
     delay(1000);
   }
   Serial.println("Dang quet...");
+
+  snapMutex = xSemaphoreCreateMutex();
+  // Mang chay tren core 0 de TLS/Wi-Fi khong lam nghen viec doc lidar (loop chay core 1)
+  xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 0);
 }
 
 void loop() {

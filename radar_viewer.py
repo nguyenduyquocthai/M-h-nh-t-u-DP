@@ -19,11 +19,12 @@ import numpy as np
 from matplotlib.animation import FuncAnimation
 
 BINS = 720            # do phan giai 0.5 do
-MAX_AGE = 0.35        # giay: diem cu hon se bi xoa khoi man hinh
+MAX_AGE = 0.35        # giay: diem cu hon se bi xoa khoi man hinh (che do MQTT dung 2.0)
 
 
 class PointStore:
-    def __init__(self):
+    def __init__(self, max_age=MAX_AGE):
+        self.max_age = max_age
         self.lock = threading.Lock()
         self.dist = np.zeros(BINS, dtype=np.float32)
         self.stamp = np.zeros(BINS, dtype=np.float64)
@@ -57,7 +58,7 @@ class PointStore:
     def snapshot(self, max_mm):
         now = time.time()
         with self.lock:
-            ok = (now - self.stamp < MAX_AGE) & (self.dist > 0) & (self.dist <= max_mm)
+            ok = (now - self.stamp < self.max_age) & (self.dist > 0) & (self.dist <= max_mm)
             ang = (np.nonzero(ok)[0] + 0.5) / 2.0
             dist = self.dist[ok].copy()
             return ang, dist, self.rate, self.rps
@@ -79,6 +80,40 @@ def serial_reader(store, port, baud, stop):
         except ValueError:
             pass
     ser.close()
+
+
+def mqtt_reader(store, host, port, topic, stop):
+    """Nhan ban tin JSON tu broker (ESP32 gui moi giay, 360 gia tri 'ranges')."""
+    import json
+    import ssl
+    import paho.mqtt.client as mqtt
+
+    def on_connect(c, u, f, rc, props=None):
+        print("MQTT %s:%d -> %s, subscribe %s" % (host, port, rc, topic))
+        c.subscribe(topic)
+
+    def on_message(c, u, m):
+        try:
+            d = json.loads(m.payload)
+        except ValueError:
+            return
+        if d.get("status") != "ok":
+            print("lidar status:", d.get("status"))
+            return
+        for deg, mm in enumerate(d.get("ranges", [])):
+            if mm:
+                store.add(float(deg), float(mm))
+        store.rps = 0.0
+        print("rev %s  points %s  nearest %s mm @ %s deg  rssi %s" % (
+            d.get("rev"), d.get("points"), d.get("nearest_mm"), d.get("nearest_deg"), d.get("rssi")))
+
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="radar-viewer-%d" % int(time.time()))
+    c.on_connect, c.on_message = on_connect, on_message
+    c.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+    c.connect(host, port, 30)
+    c.loop_start()
+    stop.wait()
+    c.loop_stop()
 
 
 def demo_reader(store, stop):
@@ -114,12 +149,18 @@ def main():
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--max", type=int, default=6000, help="ban kinh hien thi (mm)")
     ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--mqtt", action="store_true", help="nhan du lieu tu MQTT broker thay vi cong COM")
+    ap.add_argument("--host", default="broker.emqx.io")
+    ap.add_argument("--mqtt-port", type=int, default=8883)
+    ap.add_argument("--topic", default="bas/BAS_LIDAR_001/telemetry")
     ap.add_argument("--save", help="(kiem thu) ve 1 khung roi luu ra file anh va thoat")
     args = ap.parse_args()
 
-    store = PointStore()
+    store = PointStore(max_age=2.0 if args.mqtt else MAX_AGE)
     stop = threading.Event()
-    if args.demo:
+    if args.mqtt:
+        target, targs = mqtt_reader, (store, args.host, args.mqtt_port, args.topic, stop)
+    elif args.demo:
         target, targs = demo_reader, (store, stop)
     else:
         port = args.port or find_port()
@@ -144,7 +185,7 @@ def main():
         ang, dist, rate, rps = store.snapshot(args.max)
         sc.set_offsets(np.column_stack([np.radians(ang), dist]) if len(ang) else np.empty((0, 2)))
         sc.set_array(dist)
-        info.set_text("points/s: %4.0f   vong/s: %.1f   hien thi: %d diem" % (rate, rps, len(ang)))
+        info.set_text("points/s: %4.0f   vong/s: %.1f   hien thi: %d diem" % (rate, rps, len(ang)) if not args.mqtt else "MQTT %s  |  hien thi: %d diem" % (args.topic, len(ang)))
         return sc, info
 
     ani = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
